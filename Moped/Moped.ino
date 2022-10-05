@@ -7,7 +7,6 @@ int rpm;
 int limit_rpm;
 int kill_delay;
 unsigned long timeold;
-bool revolution = false;
 bool isLimitOn = true;
 bool isDebug = false;
 String str_ii = "";
