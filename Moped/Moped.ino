@@ -58,7 +58,7 @@ void loop()
             digitalWrite(relayPin, LOW);
             if (isDebug){
                 digitalWrite(LED_BUILTIN, HIGH);
-                ble_device.println("RPM "+String(rpm));
+                ble_device.println("RPM "+String(revolutionsResult));
             }
         }
     } else {
@@ -67,7 +67,7 @@ void loop()
     }
 
     if (ble_device.available()) {
-        String str_ii = "";
+        static String str_ii = "";
 
         digitalWrite(LED_BUILTIN, HIGH);
         char in_char = ble_device.read();
@@ -91,6 +91,7 @@ void loop()
                 duration = str_ii.substring(9, str_ii.length()).toInt();
                 writeIntIntoEEPROM(3, duration);
             }
+            str_ii = "";
             printLimitsStatus();
         }
     }

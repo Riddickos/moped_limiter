@@ -1,10 +1,10 @@
 #ifndef TIMER1_H
 #define TIMER1_H
 
-#include "types.h"
 #include <avr/io.h>
 #include <avr/interrupt.h>
 
+#define byte uint8_t
 #define TIMER_FRQ_Hz 16000000.0
 #define MAX_OCR1A 65535.0
 #define STEP1 (((MAX_OCR1A + 1) * 2 * 1) / TIMER_FRQ_Hz)
