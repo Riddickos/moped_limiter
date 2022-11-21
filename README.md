@@ -8,5 +8,4 @@ MLT-BT05 is used to get commands from the phone remotely
 	- TOGGLE_LIMIT Enables/Disables limiter <br>
 	- TOGGLE_DEBUG Activates debug output to connected bluetooth device <br>
 	- RPM_[value] sets required max RPM after which controller suppose to start blocking the engine <br>
-	- DELAY_[value] sets required delay for how long to block the engine after each rotation over the limit <br>
-	- LOCK_RELAY_[value] test command to forcibly block the engine using relay
+	- DELAY_[value] sets required delay for how long to block the engine after each rotation over the limit
