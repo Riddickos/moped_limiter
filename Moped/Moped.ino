@@ -1,97 +1,201 @@
+// Aprilia RS4 50 limiter.
+// Hall sensor on the gearbox -> pin 2 (INT0). When RPM goes over the limit,
+// the solid state relay cuts ignition (kill switch) for KILL time, then releases.
+// Settings come over BLE (MLT-BT05) and are stored in EEPROM.
+
 #include <SoftwareSerial.h>
 #include <EEPROM.h>
-SoftwareSerial ble_device(4, 3); // RX | TX
-#define relayPin A1
 
-int rpm;
-int limit_rpm;
-int kill_delay;
-unsigned long timeold;
+// ---- Pins ----
+const uint8_t SENSOR_PIN = 2;   // must be an interrupt pin
+const uint8_t RELAY_PIN  = A1;  // HIGH = engine runs, LOW = ignition cut
+const uint8_t BLE_RX_PIN = 4;
+const uint8_t BLE_TX_PIN = 3;
+
+// ---- EEPROM layout (kept compatible with older versions) ----
+const int ADDR_LIMIT_RPM  = 1;
+const int ADDR_KILL_DELAY = 3;
+
+// ---- Sanity limits ----
+const int DEFAULT_LIMIT_RPM  = 6000;
+const int DEFAULT_KILL_DELAY = 20;     // ms
+const int MIN_LIMIT_RPM      = 100;
+const int MAX_LIMIT_RPM      = 20000;
+const int MAX_KILL_DELAY     = 2000;   // ms
+
+// Pulses closer than this are treated as noise (30000 rpm).
+const unsigned long MIN_PULSE_PERIOD_US = 2000;
+// No pulse for this long means the shaft is (almost) stopped.
+const unsigned long STALL_TIMEOUT_US = 500000;
+
+SoftwareSerial ble(BLE_RX_PIN, BLE_TX_PIN);
+
+// Shared with the interrupt
+volatile unsigned long lastPulseUs = 0;
+volatile unsigned long pulsePeriodUs = 0;
+
+// Settings
+int limitRpm;
+int killDelayMs;
 bool isLimitOn = true;
 bool isDebug = false;
-String str_ii = "";
 
-void setup()
+// Cut state
+bool isCutting = false;
+unsigned long cutStartMs = 0;
+
+// Incoming command buffer
+char cmd[24];
+uint8_t cmdLen = 0;
+
+// ---------------------------------------------------------------------------
+
+void onSensorPulse()
 {
-  pinMode(LED_BUILTIN, OUTPUT);
-  digitalWrite(LED_BUILTIN, HIGH);
-  pinMode(relayPin, OUTPUT);
-  rpm = 0;
-  timeold = 0;
-  pinMode(2, INPUT_PULLUP);
-  attachInterrupt(0, magnet_detect, RISING); //Initialize the intterrupt pin (Arduino digital pin 2)
-  limit_rpm = readIntFromEEPROM(1);
-  kill_delay = readIntFromEEPROM(3);
-  ble_device.begin(9600);
-  digitalWrite(LED_BUILTIN, LOW);
+  unsigned long now = micros();
+  unsigned long period = now - lastPulseUs;
+  if (period < MIN_PULSE_PERIOD_US) return;  // ignore noise / bounce
+  pulsePeriodUs = period;
+  lastPulseUs = now;
 }
 
-void magnet_detect(){
-  rpm = 60000 / (millis() - timeold);
-  timeold = millis();
+unsigned int readRpm()
+{
+  noInterrupts();
+  unsigned long period = pulsePeriodUs;
+  unsigned long last = lastPulseUs;
+  interrupts();
+
+  if (period == 0 || micros() - last > STALL_TIMEOUT_US) return 0;
+  return 60000000UL / period;
 }
 
-void writeIntIntoEEPROM(int address, int number)
+// Stored big-endian, as in previous versions.
+void writeIntToEEPROM(int address, int value)
 {
-  EEPROM.write(address, number >> 8);
-  EEPROM.write(address + 1, number & 0xFF);
+  EEPROM.update(address, value >> 8);
+  EEPROM.update(address + 1, value & 0xFF);
 }
 
 int readIntFromEEPROM(int address)
 {
-  return (EEPROM.read(address) << 8) + EEPROM.read(address + 1);
+  return (EEPROM.read(address) << 8) | EEPROM.read(address + 1);
 }
 
-void printLimitsStatus()
+void loadSettings()
 {
-  ble_device.println("Debug "+String(isDebug));
-  ble_device.println("RPM "+String(limit_rpm));
-  ble_device.println("Delay "+String(kill_delay));
-  ble_device.println("Limiter "+String(isLimitOn));
+  limitRpm = readIntFromEEPROM(ADDR_LIMIT_RPM);
+  killDelayMs = readIntFromEEPROM(ADDR_KILL_DELAY);
+
+  // Blank EEPROM reads as -1, which would cut the engine permanently.
+  if (limitRpm < MIN_LIMIT_RPM || limitRpm > MAX_LIMIT_RPM) limitRpm = DEFAULT_LIMIT_RPM;
+  if (killDelayMs < 0 || killDelayMs > MAX_KILL_DELAY) killDelayMs = DEFAULT_KILL_DELAY;
+}
+
+// ---------------------------------------------------------------------------
+
+void setup()
+{
+  pinMode(LED_BUILTIN, OUTPUT);
+  pinMode(RELAY_PIN, OUTPUT);
+  digitalWrite(RELAY_PIN, HIGH);  // let the engine run
+
+  pinMode(SENSOR_PIN, INPUT_PULLUP);
+  attachInterrupt(digitalPinToInterrupt(SENSOR_PIN), onSensorPulse, RISING);
+
+  loadSettings();
+  ble.begin(9600);
 }
 
 void loop()
 {
-  if ((rpm > limit_rpm)) {
-    if (isLimitOn) {
-      digitalWrite(relayPin, LOW);
-      if (isDebug){
-        digitalWrite(LED_BUILTIN, HIGH);
-        ble_device.println("RPM "+String(rpm));
-      }
-      delay(kill_delay);
-      rpm = 0;
-    }
-  } else {
-    digitalWrite(relayPin, HIGH);
-    digitalWrite(LED_BUILTIN, LOW);
+  updateLimiter();
+  readCommands();
+}
+
+// ---- Limiter ----
+
+void updateLimiter()
+{
+  if (isCutting) {
+    if (millis() - cutStartMs < (unsigned long)killDelayMs) return;
+    releaseIgnition();
   }
 
-  if (ble_device.available()) {
+  unsigned int rpm = readRpm();
+  if (isLimitOn && rpm > (unsigned int)limitRpm) {
+    cutIgnition(rpm);
+  }
+}
+
+void cutIgnition(unsigned int rpm)
+{
+  digitalWrite(RELAY_PIN, LOW);
+  isCutting = true;
+  cutStartMs = millis();
+
+  if (isDebug) {
     digitalWrite(LED_BUILTIN, HIGH);
-    char in_char = ble_device.read();
-    if (int(in_char) != -1 and int(in_char) != 42) {
-      if (in_char != '\n' and in_char != '\r') {
-        str_ii += in_char;
-      }
-    }
-    if (in_char == '\n') {
-      if (str_ii == "TOGGLE_LIMIT") {
-        isLimitOn = !isLimitOn;
-      }
-      if (str_ii == "TOGGLE_DEBUG") {
-        isDebug = !isDebug;
-      }
-      if (str_ii.startsWith("RPM_")) {
-        limit_rpm = str_ii.substring(4, str_ii.length()).toInt();
-        writeIntIntoEEPROM(1, limit_rpm);
-      }
-      if (str_ii.startsWith("DELAY_")) {
-        kill_delay = str_ii.substring(6, str_ii.length()).toInt();
-        writeIntIntoEEPROM(3, kill_delay);
-      }
-      printLimitsStatus();
-      str_ii = "";
+    ble.print(F("RPM "));
+    ble.println(rpm);
+  }
+}
+
+void releaseIgnition()
+{
+  digitalWrite(RELAY_PIN, HIGH);
+  digitalWrite(LED_BUILTIN, LOW);
+  isCutting = false;
+}
+
+// ---- BLE commands ----
+
+void readCommands()
+{
+  while (ble.available()) {
+    char c = ble.read();
+
+    if (c == '\n') {
+      cmd[cmdLen] = '\0';
+      handleCommand(cmd);
+      cmdLen = 0;
+    } else if (c != '\r' && c != '*' && cmdLen < sizeof(cmd) - 1) {
+      cmd[cmdLen++] = c;
     }
   }
+}
+
+void handleCommand(const char *command)
+{
+  if (strcmp(command, "TOGGLE_LIMIT") == 0) {
+    isLimitOn = !isLimitOn;
+  } else if (strcmp(command, "TOGGLE_DEBUG") == 0) {
+    isDebug = !isDebug;
+  } else if (strncmp(command, "RPM_", 4) == 0) {
+    int value = atoi(command + 4);
+    if (value >= MIN_LIMIT_RPM && value <= MAX_LIMIT_RPM) {
+      limitRpm = value;
+      writeIntToEEPROM(ADDR_LIMIT_RPM, limitRpm);
+    } else {
+      ble.println(F("Bad RPM value"));
+    }
+  } else if (strncmp(command, "DELAY_", 6) == 0) {
+    int value = atoi(command + 6);
+    if (value >= 0 && value <= MAX_KILL_DELAY) {
+      killDelayMs = value;
+      writeIntToEEPROM(ADDR_KILL_DELAY, killDelayMs);
+    } else {
+      ble.println(F("Bad DELAY value"));
+    }
+  }
+
+  printStatus();
+}
+
+void printStatus()
+{
+  ble.print(F("Debug "));   ble.println(isDebug);
+  ble.print(F("RPM "));     ble.println(limitRpm);
+  ble.print(F("Delay "));   ble.println(killDelayMs);
+  ble.print(F("Limiter ")); ble.println(isLimitOn);
 }
